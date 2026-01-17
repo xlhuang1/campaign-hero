@@ -56,6 +56,27 @@ DEMO_IDEALS = {
     },
 }
 
+PARTY_ARCHETYPES = {
+    # 0..100 axes:
+    # econ: socialist -> capitalist
+    # social: liberal -> conservative
+    # governance: legislative -> executive
+    # tone: message-driven -> partisan attack
+    "D":   {"econ": 40, "social": 25, "governance": 45, "tone": 40},
+    "R":   {"econ": 70, "social": 75, "governance": 65, "tone": 65},
+    "IND": {"econ": 50, "social": 50, "governance": 50, "tone": 45},
+}
+
+# How much each demo cares about “party-brand mismatch”
+DEMO_PARTY_LOYALTY = {
+    "working": 0.9,
+    "college": 1.1,
+    "rural": 1.0,
+    "urban": 1.0,
+    "seniors": 1.0,
+    "youth": 0.8,
+}
+
 DEMO_SENSITIVITY = {
     "working": 1.00,
     "college": 1.10,
@@ -130,6 +151,7 @@ class GameState:
     phase: str = "PRIMARY"  # PRIMARY or GENERAL
     weeks_in_phase: int = 6
     support_by_demo: Dict[str, float] = field(default_factory=dict)
+    prepared: bool = False
     name_id: float = 0.20  # name recognition (0..1)
     enthusiasm: float = 0.50  # affects turnout and canvass effectiveness (0..1)
     earned_media: float = 0.00  # temporary weekly boost from virality (0..1)
@@ -140,7 +162,7 @@ class GameState:
 
 
 # ----------------------------
-# Utilities
+# Utilities / Helpers
 # ----------------------------
 
 def rclamp(x: float, lo: float, hi: float) -> float:
@@ -174,17 +196,131 @@ def initial_support_by_demo(district: District, you: Candidate) -> Dict[str, flo
     Creates per-demo support starting point. Overall support emerges from district weights.
     """
     out: Dict[str, float] = {}
+    mismatch = party_platform_mismatch(you)  # 0..1
+    max_penalty = 0.04
+
     for demo in DEMO_KEYS:
         fit = platform_fit_score(you, demo) * DEMO_SENSITIVITY[demo]
-        # Base starts around 0.47, plus small district lean pull, plus platform fit effect.
-        # Fit effect magnitude is a tuning knob.
         base = 0.47 + district.partisan_lean * 0.35
-        demo_support = base + (0.06 * fit)  # +/- ~6% from platform alignment
+
+        demo_support = base + (0.06 * fit)
+
+        # Party-brand mismatch penalty (off-brand candidates look "inauthentic")
+        loyalty = DEMO_PARTY_LOYALTY[demo]
+        size = 0.6 + 0.8 * district.demos[demo]
+        demo_support -= mismatch * max_penalty * loyalty * size
+
         out[demo] = rclamp(demo_support, 0.20, 0.80)
+
     return out
 
 def overall_support(district: District, support_by_demo: Dict[str, float]) -> float:
     return sum(district.demos[d] * support_by_demo[d] for d in DEMO_KEYS)
+
+def party_platform_mismatch(c: Candidate) -> float:
+    """
+    Returns mismatch in [0..1]. 0 = perfectly on-brand for party.
+    """
+    party = (c.party or "IND").upper()
+    if party not in PARTY_ARCHETYPES:
+        party = "IND"
+    arch = PARTY_ARCHETYPES[party]
+
+    dist = (
+                   abs(c.econ - arch["econ"]) +
+                   abs(c.social - arch["social"]) +
+                   abs(c.governance - arch["governance"]) +
+                   abs(c.tone - arch["tone"])
+           ) / 4.0  # 0..100
+    return dist / 100.0  # 0..1
+
+def party_brand_effect_by_demo(gs: GameState) -> Dict[str, float]:
+    """
+    Produces per-demo support adjustments based on party-platform consistency.
+    Negative when you're off-brand (e.g. very progressive 'R').
+    """
+    m = party_platform_mismatch(gs.you)  # 0..1
+    # Tuning knob: max penalty at full mismatch ~ -4% per demo (scaled by loyalty)
+    max_penalty = 0.04
+
+    out: Dict[str, float] = {}
+    for demo in DEMO_KEYS:
+        loyalty = DEMO_PARTY_LOYALTY[demo]
+        # Stronger effect for larger demos in the district
+        size = 0.6 + 0.8 * gs.district.demos[demo]
+        out[demo] = -(m * max_penalty * loyalty * size)
+    return out
+
+def district_lean_label(d: District) -> str:
+    if d.partisan_lean > 0.10:
+        return "leans you"
+    if d.partisan_lean > 0.03:
+        return "tilts you"
+    if d.partisan_lean < -0.10:
+        return "leans opponent"
+    if d.partisan_lean < -0.03:
+        return "tilts opponent"
+    return "toss-up"
+
+def environment_capsule(d: District) -> str:
+    if d.media_intensity >= 1.20:
+        media = "Loud media"
+    elif d.media_intensity <= 0.90:
+        media = "Quiet media"
+    else:
+        media = "Normal media"
+
+    if d.volatility >= 1.20:
+        vol = "high volatility"
+    elif d.volatility <= 0.90:
+        vol = "low volatility"
+    else:
+        vol = "medium volatility"
+
+    if d.turnout_base >= 0.60:
+        turnout = "high-turnout"
+    elif d.turnout_base <= 0.50:
+        turnout = "low-turnout"
+    else:
+        turnout = "mid-turnout"
+
+    return f"{media} • {vol} • {turnout} district"
+
+
+def stance_word(value: int, left: str, right: str) -> str:
+    # 0..100 -> left / center-ish / right
+    if value <= 33:
+        return left
+    if value >= 67:
+        return right
+    return "moderate"
+
+
+def candidate_pitch(c: Candidate) -> str:
+    econ = stance_word(c.econ, "socialist-leaning", "capitalist-leaning")
+    social = stance_word(c.social, "liberal", "conservative")
+    gov = stance_word(c.governance, "legislative-first", "executive-first")
+    tone = stance_word(c.tone, "message-driven", "attack-focused")
+
+    # Slightly nicer phrasing when "moderate"
+    def soften(word: str, axis: str) -> str:
+        if word != "moderate":
+            return word
+        return {
+            "econ": "economically moderate",
+            "social": "socially moderate",
+            "gov": "institutional",
+            "tone": "measured",
+        }[axis]
+
+    econ = soften(econ, "econ")
+    social = soften(social, "social")
+    gov = soften(gov, "gov")
+    tone = soften(tone, "tone")
+
+    return f"{tone}, {gov} candidate — {econ}, {social} platform."
+
+
 
 # ----------------------------
 # Generators
@@ -255,7 +391,7 @@ def weekly_decay(gs: GameState) -> None:
     gs.earned_media *= 0.35
     gs.enthusiasm = rclamp(gs.enthusiasm - 0.01, 0.2, 0.9)
     gs.you.momentum *= 0.85
-    gs.you.fatigue = rclamp(gs.you.fatigue + 0.5, 0, 10)
+    gs.you.fatigue = rclamp(gs.you.fatigue - 0.8, 0, 10)
     gs.you.clamp()
 
 def apply_support_shift(gs: GameState, delta: float, reason: str, demo_weights: Dict[str, float] = None) -> None:
@@ -375,14 +511,15 @@ def adjust_policy(gs: GameState, axis: str, direction: int) -> None:
     gs.you.fatigue = rclamp(gs.you.fatigue + 0.8, 0, 10)
 
 def rest(gs: GameState) -> None:
-    gs.you.fatigue = rclamp(gs.you.fatigue - 2.5, 0, 10)
-    gs.you.momentum = rclamp(gs.you.momentum + 0.05, -10, 10)
+    gs.you.fatigue = rclamp(gs.you.fatigue - 4.0, 0, 10)
+    gs.you.momentum += 0.3
     gs.log("You rest, reset, and do fewer self-inflicted errors this week.")
 
 def prep_debate(gs: GameState) -> None:
     # Improves discipline effect; costs stamina
     gs.you.momentum += 0.10
     gs.you.fatigue = rclamp(gs.you.fatigue + 0.9, 0, 10)
+    gs.prepared = True
     gs.log("Debate prep: message drills, oppo research, and rehearsed pivots.")
 
 def maybe_scandal(gs: GameState) -> None:
@@ -403,17 +540,27 @@ def maybe_scandal(gs: GameState) -> None:
         gs.log("Your opponent steps on a rake. You don’t even have to swing.")
 
 def debate(gs: GameState) -> None:
-    # Performance influenced by stats, fatigue, prep (momentum), opponent skill, and randomness
-    you_power = (
-            0.45 * gs.you.charisma
-            + 0.35 * gs.you.discipline
-            + 0.20 * gs.you.empathy
-            + 6.0 * gs.you.momentum
-            - 4.0 * gs.you.fatigue
-    )
-    opp_power = gs.opponent.skill + roll(0, 6)
+    # If you prepped, you get a real advantage this debate.
+    prepared = getattr(gs, "prepared", False)
 
-    perf = roll(you_power - opp_power, 8)
+    # Rescaled: candidate stats (5..25-ish) now generate ~30..80 power.
+    you_power = (
+            2.5 * gs.you.charisma
+            + 2.0 * gs.you.discipline
+            + 1.5 * gs.you.empathy
+            + 8.0 * gs.you.momentum
+            - 3.0 * gs.you.fatigue
+    )
+
+    if prepared:
+        you_power += 6.0  # tangible prep boost
+
+    # Opponent power stays in the ~40..75 range
+    opp_power = gs.opponent.skill + roll(0, 4)
+
+    # Narrower randomness so outcomes track the inputs more
+    perf = roll(you_power - opp_power, 6)
+    gs.log(f"[DEBUG] debate: you_power={you_power:.1f} opp_power={opp_power:.1f} perf={perf:.1f} prepared={prepared}")
 
     # Zinger chance increases with charisma + tone (more aggressive) + media intensity
     zinger_chance = rclamp(
@@ -454,10 +601,13 @@ def debate(gs: GameState) -> None:
 
     # Zinger adds earned media, may add support, can backfire with low empathy / very high tone
     if zinger:
-        viral = rclamp(0.12 + (gs.you.tone / 300) + (gs.district.media_intensity - 1.0) * 0.15, 0.08, 0.40)
+        viral = rclamp(
+            0.12 + (gs.you.tone / 300) + (gs.district.media_intensity - 1.0) * 0.15,
+            0.08,
+            0.40,
+            )
         gs.earned_media = rclamp(gs.earned_media + viral, 0.0, 0.70)
 
-        # Backfire chance increases if tone high and empathy low
         backfire_chance = rclamp(0.08 + (gs.you.tone / 220) - (gs.you.empathy / 260), 0.02, 0.35)
         backfire = random.random() < backfire_chance
 
@@ -472,25 +622,44 @@ def debate(gs: GameState) -> None:
 
     zinger_weights = {"youth": 0.35, "urban": 0.30, "college": 0.25, "working": 0.05, "rural": 0.03, "seniors": 0.02}
     apply_support_shift(gs, delta, f"Debate night: {headline}", demo_weights=zinger_weights)
+
     gs.you.fatigue = rclamp(gs.you.fatigue + 1.5, 0, 10)
     gs.you.clamp()
 
+    # Prep is consumed
+    if hasattr(gs, "prepared"):
+        gs.prepared = False
+
+
 def paid_media(gs: GameState) -> None:
-    # Spend cash to move persuasion via ads; diminishing returns
-    if gs.you.cash <= 0:
+    # Auto ads: spend a capped fraction of cash, never zeroing out the campaign
+    if gs.you.cash < 5:
+        return  # too broke to meaningfully advertise
+
+    max_fraction = 0.5  # at most 50% of current cash
+    hard_cap = 20       # never more than $20k
+    floor_cash = 5      # always leave at least $5k
+    min_spend = 3       # don't bother running ads for less than $3k
+
+    affordable = max(0, gs.you.cash - floor_cash)
+    spend = min(hard_cap, affordable, int(gs.you.cash * max_fraction))
+
+    if spend < min_spend:
         return
-    spend = min(20, gs.you.cash)
+
     gs.you.cash -= spend
+
     eff = (0.004 + (spend / 5000)) * (1.0 + gs.name_id * 0.4)
     apply_support_shift(gs, eff, f"Paid media (${spend}k)")
     gs.log(f"Ads run: spent ${spend}k.")
+
 
 def earned_media_tick(gs: GameState) -> None:
     if gs.earned_media <= 0:
         return
     bump = 0.004 * gs.earned_media
     apply_support_shift(gs, bump, "Earned media tailwind")
-    gs.log(f"Earned media effect this week: +{pct(bump)} support-ish (small but real).")
+    gs.log(f"Earned media effect this week: +{bump*100:.2f}% support-ish.")
 
 
 # ----------------------------
@@ -610,10 +779,81 @@ def print_status(gs: GameState) -> None:
     overall = overall_support(gs.district, gs.support_by_demo)
     print(f"Support: {pct(overall)} | Cash: ${gs.you.cash}k | Name ID: {pct(gs.name_id)}")
     print(f"Momentum: {gs.you.momentum:+.2f} | Fatigue: {gs.you.fatigue:.1f} | Enthusiasm: {pct(gs.enthusiasm)}")
+
+    print(next_debate_info(gs))
+    print(f"Environment: {environment_capsule(gs.district)}")
+
     if gs.earned_media > 0.01:
         print(f"Earned media (lingering): {gs.earned_media:.2f}")
     print(f"Weeks left in phase: {phase_weeks_left}")
     print("=" * 60)
+
+
+def describe_environment(d: District) -> str:
+    # Media intensity
+    if d.media_intensity >= 1.20:
+        media = "a high-volume media market"
+    elif d.media_intensity >= 1.05:
+        media = "a busy media market"
+    elif d.media_intensity <= 0.90:
+        media = "a quiet media market"
+    else:
+        media = "a normal media market"
+
+    # Volatility
+    if d.volatility >= 1.20:
+        vol = "highly volatile"
+    elif d.volatility <= 0.90:
+        vol = "stable"
+    else:
+        vol = "moderately volatile"
+
+    return f"{media} and a {vol} electorate"
+
+
+def print_campaign_kickoff(gs: GameState) -> None:
+    d = gs.district
+    you = gs.you
+    opp = gs.opponent
+
+    overall = overall_support(d, gs.support_by_demo)
+
+    top = sorted(d.demos.items(), key=lambda x: x[1], reverse=True)[:3]
+    top_str = ", ".join(f"{k} {int(v*100)}%" for k, v in top)
+
+    debate_weeks = get_debate_weeks(gs.phase, gs.weeks_in_phase)
+    debate_str = ", ".join(str(w) for w in debate_weeks) if debate_weeks else "none"
+
+    lean = district_lean_label(d)
+    env = environment_capsule(d)
+    pitch = candidate_pitch(you)
+
+    print("\n" + "=" * 60)
+    print("CAMPAIGN KICKOFF")
+    print("=" * 60)
+    print(f"{you.name} ({you.party}) is running in {d.name}, a district that {lean}.")
+    print(f"{env}. Core blocs: {top_str}.")
+    print(f"Your opening pitch: {pitch}")
+    print(f"Primary opponent: {opp.name} — {opp.archetype} (skill {opp.skill}).")
+    print("-" * 60)
+    print(f"Opening support: {pct(overall)} | Name ID: {pct(gs.name_id)} | Cash: ${you.cash}k")
+    print(f"Platform values: Econ {you.econ} | Social {you.social} | Gov {you.governance} | Tone {you.tone}")
+    print(f"Scheduled debate weeks (PRIMARY): {debate_str}")
+    print("=" * 60)
+    input("\nPress Enter to begin the campaign...")
+
+
+def next_debate_info(gs: GameState) -> str:
+    debate_weeks = get_debate_weeks(gs.phase, gs.weeks_in_phase)
+    future = [w for w in debate_weeks if w >= gs.week]
+    if not future:
+        return "Next debate: none"
+    nxt = future[0]
+    if nxt == gs.week:
+        return "Next debate: THIS WEEK Tip: Debate Prep or Rest can help this week."
+    delta = nxt - gs.week
+    return f"Next debate: Week {nxt} (in {delta} week{'s' if delta != 1 else ''})"
+
 
 def print_recent(gs: GameState, n: int = 5) -> None:
     if not gs.history:
@@ -685,9 +925,37 @@ def run_week(gs: GameState) -> None:
 def make_candidate() -> Candidate:
     print("Welcome to Campaign Hero (prototype).")
     name = input("Candidate name> ").strip() or "Alex Candidate"
-    party = input("Party (D/R/Ind)> ").strip() or "Ind"
 
-    # Simple stat allocation
+    c = Candidate(
+        name=name,
+        party="IND",
+        charisma=5,
+        discipline=5,
+        empathy=5,
+        stamina=5,
+    )
+
+    # 1) Platform first
+    choose_platform(c)
+
+    # 2) Party second (and party interacts with platform later via mismatch)
+    print("\nChoose your party label:")
+    print("  D) Democrat")
+    print("  R) Republican")
+    print("  I) Independent")
+    while True:
+        p = input("> ").strip().upper()
+        if p in {"D", "R", "I", "IND"}:
+            c.party = "IND" if p in {"I", "IND"} else p
+            break
+        print("Enter D, R, or I.")
+
+    m = party_platform_mismatch(c)
+    print(f"\nParty-platform consistency: {int((1.0 - m) * 100)}%")
+    if m > 0.60:
+        print("Warning: Your platform is very off-brand for this party. Expect authenticity penalties.")
+
+    # 3) Stats last
     print("\nAllocate 20 points among stats (charisma, discipline, empathy, stamina).")
     base = {"charisma": 5, "discipline": 5, "empathy": 5, "stamina": 5}
     points = 20
@@ -705,17 +973,15 @@ def make_candidate() -> Candidate:
                 return base[k] + v
             print("Out of range.")
 
-    c = Candidate(
-        name=name,
-        party=party,
-        charisma=ask_stat("charisma"),
-        discipline=ask_stat("discipline"),
-        empathy=ask_stat("empathy"),
-        stamina=ask_stat("stamina"),
-    )
+    c.charisma = ask_stat("charisma")
+    c.discipline = ask_stat("discipline")
+    c.empathy = ask_stat("empathy")
+    c.stamina = ask_stat("stamina")
+
+    c.clamp()
     print(f"\nRemaining unspent points (auto ignored): {points}")
-    choose_platform(c)
     return c
+
 
 def choose_platform(c: Candidate) -> None:
     def ask_axis(label: str, left: str, right: str, description: str) -> int:
@@ -786,9 +1052,7 @@ def main() -> None:
     gs.history.append(district.describe())
     gs.history.append(f"Primary opponent: {opp.name} ({opp.archetype}, skill {opp.skill})")
 
-    print("\n" + district.describe())
-    print(f"\nYour opponent (primary): {opp.name} — {opp.archetype} (skill {opp.skill})")
-    input("\nPress Enter to begin the campaign...")
+    print_campaign_kickoff(gs)
 
     while True:
         run_week(gs)
